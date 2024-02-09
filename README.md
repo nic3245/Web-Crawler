@@ -1,5 +1,5 @@
 # Web-Crawler
-A from scratch, no (crawler) package web crawler to college secret flags on a fake website
+A from scratch, no (crawler) package web crawler to find and print secret flags on a fake website.
 # Description
 The fake website can be found here: [Fakebook](https://www.3700.network/) <br>
 3700crawler is run with optional server and port, and with the username and password to log into fakebook with. <br>
