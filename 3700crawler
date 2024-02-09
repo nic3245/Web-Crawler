@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import ssl
+import threading
+from queue import Queue
+import select
+
+DEFAULT_SERVER = "www.3700.network"
+DEFAULT_PORT = 443
+HTTP_VERSION = "HTTP/1.1"
+NUM_THREADS = 5
+NUM_FLAGS = 5
+
+
+def clean_chunked_response(response):
+    """
+    Cleans a chunked response into the intended message
+    :param response: the message to be cleaned
+    :return: the cleaned message
+    """
+    response_headers = response[:response.find("\r\n\r\n")]
+    response_body = response[response.find("\r\n\r\n"):].strip() + "\r\n"
+    response_body_string = ""
+    while response_body:
+        # Get index of first newline
+        crlf_index = response_body.find('\r\n')
+        # Get the chunk size
+        chunk_size_hex = response_body[:crlf_index]
+        chunk_size = int(chunk_size_hex, 16)
+
+        # Check if the chunk size is zero
+        if chunk_size == 0:
+            # End of chunks, exit the loop
+            break
+
+        # Get rid of already read info
+        response_body = response_body[crlf_index + 2:]
+
+        # Read the data for the chunk
+        chunk_data = response_body[:chunk_size]
+        response_body_string += chunk_data
+
+        # Get rid of already read info
+        response_body = response_body[chunk_size + 2:]
+
+    return response_headers + "\r\n" + response_body_string
+
+
+class Crawler:
+    """
+    Class representing a web crawler
+    """
+
+    def __init__(self, args):
+        """
+        Constructor for a web crawler that taken in args with server, port, username, and password fields
+        :param args: object with server, port, username, and password fields
+        """
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.cookies = []  # List of any cookies specified by the server
+        self.flags = []  # List of flags
+        self.visit_queue = Queue()  # Crawling horizon - people profile urls only, not friend lists
+        self.visited = set()  # Already visited people profile urls
+        self.stop_threads = False  # Variable so that threads can stop working when all flags are found
+
+    def format_get_request(self, file):
+        """
+        Formats a get request to the given file location for the crawler's server and current cookies
+        :param file: the file location on the server to get
+        :return: the properly formatted http request
+        """
+        request = f"GET {file} {HTTP_VERSION}\r\n" \
+                  f"Host: {self.server}:{self.port}\r\n" \
+                  f"Connection: close\r\n" \
+                  f"Cookie: "
+        for cookie in self.cookies:
+            request += f"{cookie}; "
+        request = request[:-2]  # Chop off extra semicolon space
+        request += "\r\n\r\n"
+        return request
+
+    def retrieve_cookies(self, response):
+        """
+        Gets the cookies from a response and saves them in this crawler
+        :param response: the message to retrieve the cookies from
+        """
+        # Splits by line, which effectively gives headers (although it includes body too, but it isn't relevant here)
+        for header in response.split("\r\n"):
+            if "set-cookie:" in header:
+                cookie = header[12:]
+                cookie = cookie[:cookie.find(";")]
+                match = False
+                # Make sure it's not overwriting a cookie already stored
+                for og_c in self.cookies:
+                    if cookie.startswith(og_c[:4]):
+                        self.cookies[self.cookies.index(og_c)] = cookie
+                        match = True
+                        break
+                if not match:
+                    self.cookies.append(cookie)
+
+    def send_request(self, request):
+        """
+        Sends the given request and returns a proper response.
+        Proper meaning that it checks for 302, 403, 404, and 503 errors
+        :param request:
+        :raise ValueError: on 403/404 results
+        :return: the proper end response
+        """
+        # HTTPS setup
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((self.server, self.port))
+            context = ssl.create_default_context()
+            with context.wrap_socket(sock, server_hostname=self.server) as mysocket:
+                # Send the request
+                mysocket.send(request.encode('ascii'))
+                # Read the response
+                response_data = b''
+                while True:
+                    if is_socket_ready_to_read(mysocket, timeout=1):
+                        data = mysocket.recv(1024)
+                        if not data:
+                            break  # No more data to read
+                        response_data += data
+                    else:
+                        break  # No data available, exit the loop
+                decoded_response = response_data.decode('utf-8')
+                # Check if it was chunked
+                if "Transfer-Encoding: chunked" in decoded_response:
+                    decoded_response = clean_chunked_response(decoded_response)
+
+                # Extract status code
+                status_code = int(decoded_response.split()[1])
+
+                # OK - return response
+                if str(status_code)[0] == "2":
+                    return decoded_response
+                # Found - redirect to URL found in location header
+                elif status_code == 302:
+                    location_header = ""
+                    for header in decoded_response.split("\r\n"):
+                        if header.startswith("location: "):
+                            location_header = header.split(': ', 1)[1]
+                    self.retrieve_cookies(decoded_response)
+                    try:
+                        r = self.send_request(self.format_get_request(location_header))
+                    except ValueError:
+                        raise ValueError("Forbidden or Not Found status code")
+                    return r
+                # Forbidden or Not Found - abandon URL
+                elif status_code == 403 or status_code == 404:
+                    # catch this in outer function and abandon
+                    raise ValueError("Forbidden or Not Found status code")
+                # Service Unavailable - retry request for URL
+                elif status_code == 503:
+                    try:
+                        r = self.send_request(request)
+                    except ValueError:
+                        raise ValueError("Forbidden or Not Found status code")
+                    return r
+                # Unknown error - raise because should not happen
+                else:
+                    raise RuntimeError(f"Invalid status code: {status_code}\nFull Response:\n{decoded_response}")
+
+    def run(self):
+        """
+        Runs the webcrawler by logging in and then
+        """
+        # First request for homepage
+        request = f"GET /fakebook/ {HTTP_VERSION}\r\n" \
+                  f"Host: {self.server}:{self.port}\r\n" \
+                  f"Connection: close\r\n\r\n"
+
+        response = self.send_request(request)
+
+        # Extract cookie from the response (response should be login page because redirect)
+        self.retrieve_cookies(response)
+
+        # Have to get the middleware cookie
+        middleware_token = response[response.find("name=\"csrfmiddlewaretoken\"") + 26:]
+        middleware_token = middleware_token[middleware_token.find("\"") + 1:]
+        middleware_token = middleware_token[:middleware_token.find("\"")]
+
+        # PUT login info and request for homepage
+        url_encode = (f"username={self.username}&password={self.password}&csrfmiddlewaretoken={middleware_token}"
+                      f"&next=%2Ffakebook%2F")
+        # Manually format because different from other requests
+        login_post = f"POST /accounts/login/?next=/fakebook/ {HTTP_VERSION}\r\n" \
+                     f"Host: {self.server}:{self.port}\r\n" \
+                     f"Cookie: "
+        for cookie in self.cookies:
+            login_post += f"{cookie}; "
+        login_post = login_post[:-2]
+        login_post += "\r\nContent-Type: application/x-www-form-urlencoded\r\n" \
+                      f"Content-Length: {len(url_encode)}\r\n\r\n" \
+                      f"{url_encode}\r\n"
+
+        # Response is the homepage because redirect
+        response = self.send_request(login_post)
+        # Get the cookies after logging in
+        self.retrieve_cookies(response)
+        # Add the random starting links to the queue
+        self.add_links_to_visit(response)
+
+        # Begin multithreading
+        threads = []
+        for i in range(NUM_THREADS):
+            thread = threading.Thread(target=self.worker)
+            thread.start()
+            threads.append(thread)
+
+        # Wait for all threads to finish -> join all threads
+        for thread in threads:
+            thread.join()
+
+    def worker(self):
+        """
+        Worker function for the threading. Gets a url to visit and passes it to crawl, then marks it as done.
+        :return:
+        """
+        while not self.stop_threads:
+            # Get a URL from the queue
+            url = self.visit_queue.get()
+            # Call the crawl_url function
+            self.crawl(url)
+            # Mark the task as done
+            self.visit_queue.task_done()
+        return
+
+    def crawl(self, url):
+        """
+        Crawls a profile url and its friend list pages looking for flags. Saves any found flags in the crawler.
+        """
+        # If the URL has not been visited
+        if url not in self.visited:
+            # Add to visited immediately to avoid race conditions (though it would only be inefficient, not lethal)
+            self.visited.add(url)
+            # Get the homepage
+            request = self.format_get_request(url)
+            try:
+                response = self.send_request(request)
+            except ValueError:  # abandon URL
+                self.visited.add(url)
+                return  # skip rest of function
+            self.retrieve_cookies(response)
+            self.scan_for_flag(response)
+            # Also do the friend_pages
+            friend_page = 1
+            friend_url = f"{url}friends/{friend_page}/"  # url has a / at the end already
+            request = self.format_get_request(friend_url)
+            try:
+                response = self.send_request(request)
+            except ValueError:
+                response = ""
+            self.retrieve_cookies(response)
+            # While there is still another friend page to visit
+            while "next" in response[response.find("<ul id=\"pagelist\">"):]:
+                # Process this page
+                self.scan_for_flag(response)
+                self.add_links_to_visit(response)
+                # And then move on to the next one
+                friend_page += 1
+                request = self.format_get_request(f"{url}friends/{friend_page}/")
+                response = self.send_request(request)
+                self.retrieve_cookies(response)
+            # Scan for flag and add friend links on the last page as well
+            self.scan_for_flag(response)
+            self.add_links_to_visit(response)
+
+    def scan_for_flag(self, response):
+        """
+        Scans an html response for a flag, saving it if found.
+        :param response: html response to scan
+        """
+        pot_flag_index = response.find("class=\'secret_flag\' style=\"color:red\">")
+        # If found in the response
+        if pot_flag_index > -1:
+            flag = response[pot_flag_index:]
+            flag = flag[flag.find("FLAG:") + 6: flag.find("</h3>")]
+            self.flags.append(flag)
+            if len(self.flags) == NUM_FLAGS:
+                self.stop_threads = True
+
+    def add_links_to_visit(self, response):
+        """
+        Add any links found in response to the list of links that need to be visited, if they should be added.
+        A link should only be added if it has not been visited before.
+        It is okay if the link is already in the queue to visit. It results in an extra "step" in the program,
+        but not an extra request (as the crawl function makes sure the given url has not been visited before at the
+        start of the function).
+        :param response: HTML response to scan for links
+        """
+        random_list = response[response.find("<ul>"):]
+        for link in random_list.split("<li><a")[1:]:
+            if "https://" in link and self.server not in link:  # Don't go out of domain
+                continue
+            link = link[link.find("\"") + 1:]
+            link = link[:link.find("\"")]
+            if link not in self.visited:
+                self.visit_queue.put(link)
+
+
+def is_socket_ready_to_read(sock, timeout=0):
+    """
+    Returns true if the socket has data to read.
+    :param sock: socket to check
+    :param timeout: time before it should time out
+    :return:
+    """
+    readable, _, _ = select.select([sock], [], [], timeout)
+    return bool(readable)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
+    for flag in sender.flags:
+        print(flag)
